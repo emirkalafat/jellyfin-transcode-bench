@@ -1,0 +1,22 @@
+# Test media: never commit clips (copyright). Only the README of media/ is tracked.
+media/*
+!media/README.md
+
+# Benchmark output (contains file names, host names, hardware details)
+results/
+
+# Downloaded / local ffmpeg builds (fetched by tools/get-ffmpeg.*)
+ffmpeg-jellyfin/
+ffmpeg-full/
+ffmpeg/
+
+# Downloads and archives
+*.zip
+*.tar.xz
+*.7z
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+desktop.ini
+*.swp

@@ -1,0 +1,20 @@
+# Image for running synthetic-test.sh / media-test.sh with podman (e.g. on Bazzite / Fedora Atomic).
+# Build without a build context (so the media folder is not sent to the builder):
+#   podman build -t jellyfin-transcode-bench - < container/Containerfile
+#
+# Contains the user-space parts every GPU vendor needs inside the container:
+#   Intel   : i965 (Haswell and older) + iHD (Broadwell+) VAAPI drivers, oneVPL runtime for QSV, OpenCL runtime
+#   AMD     : Mesa VAAPI driver (radeonsi)
+#   NVIDIA  : the driver libraries (libnvidia-encode, libcuda, ...) are injected at run time by the NVIDIA
+#             container toolkit (CDI), they must NOT be installed here - see README-linux.txt
+FROM docker.io/library/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg vainfo intel-gpu-tools \
+      i965-va-driver intel-media-va-driver libvpl2 libmfx-gen1.2 \
+      mesa-va-drivers intel-opencl-icd ocl-icd-libopencl1 pciutils clinfo \
+      bash gawk procps util-linux coreutils ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+CMD ["bash"]
