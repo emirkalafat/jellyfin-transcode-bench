@@ -475,7 +475,7 @@ Write-Section 'Writing report'
 function F($v, $fmt) { if ($null -eq $v) { return 'n/a' } else { return ($fmt -f $v) } }
 
 $md = New-Object System.Collections.ArrayList
-[void]$md.Add("# QSV benchmark report - $HostName")
+[void]$md.Add("# Jellyfin transcode benchmark (synthetic sources) - $HostName")
 [void]$md.Add("")
 [void]$md.Add("Run: $($sys.Date) | Duration param: ${Duration}s | Quick: $($Quick.IsPresent)")
 [void]$md.Add("")

@@ -32,6 +32,7 @@
 #   --max-files N       stop after N files
 #   --no-concurrency    skip parallel-stream tests
 #   --no-local-copy     do not copy clips from a network share to local disk first
+#   --anonymize         replace clip file names with clip-01, clip-02 ... in the report and data files (logs still contain them)
 #   --quick             10 s clips, 120 s timeout, streams "1 2 3"
 #   --ffmpeg PATH  --device /dev/dri/renderDxxx (only probe/test that VAAPI node)  --libva-driver NAME  --keep-work
 
@@ -41,7 +42,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"   # repository root: media/, results/, ffmpe
 
 MEDIA_DIR="$ROOT_DIR/media"; CLIP=30; CLIP_START=120; TIMEOUT=240; STREAMS="1 2 3 4"; FILTER="*"
 VARIANTS="cpu vaapi qsv nv hybv hybq hybn vad nvd cl plc"; SCENARIOS="to1080 to720 same"; MAX_FILES=0
-NO_CONC=0; LOCAL_COPY=1; QUICK=0; KEEP_WORK=0; FFMPEG_ARG=""; DEVICE=""
+NO_CONC=0; LOCAL_COPY=1; QUICK=0; KEEP_WORK=0; FFMPEG_ARG=""; DEVICE=""; ANONYMIZE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --media) MEDIA_DIR="$2"; shift 2;;
@@ -55,12 +56,13 @@ while [ $# -gt 0 ]; do
     --max-files) MAX_FILES="$2"; shift 2;;
     --no-concurrency) NO_CONC=1; shift;;
     --no-local-copy) LOCAL_COPY=0; shift;;
+    --anonymize) ANONYMIZE=1; shift;;
     --quick) QUICK=1; shift;;
     --ffmpeg) FFMPEG_ARG="$2"; shift 2;;
     --device) DEVICE="$2"; shift 2;;
     --libva-driver) export LIBVA_DRIVER_NAME="$2"; shift 2;;
     --keep-work) KEEP_WORK=1; shift;;
-    -h|--help) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     *) die "unknown option: $1 (see --help)";;
   esac
 done
@@ -401,7 +403,7 @@ for idx in "${!SEL_FILES[@]}"; do
     if want cl "$VARIANTS" && [ "$TM" = 1 ]; then
       skip=""
       if ! has_filter tonemap_opencl; then skip="tonemap_opencl is not compiled into this ffmpeg (use jellyfin-ffmpeg)"
-      elif [ $CL_OK != 1 ]; then skip="OpenCL probe failed (no usable OpenCL runtime, see logs/sys_cl_probe.txt)"; fi
+      elif [ $CL_OK != 1 ]; then skip="OpenCL probe failed (no usable OpenCL runtime, see logs/sys_cl_probe_*.txt)"; fi
       pre=""; { [ "$W" != "$M_W" ] || [ "$H" != "$M_H" ]; } && pre="scale=${W}:${H},"
       if [ $QSV_OK = 1 ]; then cenc=(-c:v h264_qsv "${enc[@]}")
       elif [ $NV_OK = 1 ]; then cenc=(-c:v h264_nvenc $NV_ENCOPT -b:v "${B}M")
@@ -466,57 +468,261 @@ fi
 
 # ------------------------------------------------------------------ report
 section "Writing report"
+
+# ---- naming helpers
+class_label() {   # hevc-4k-hdr10 -> "4K HEVC HDR10"
+  local c="$1" codec res rest dr
+  codec="${c%%-*}"; rest="${c#*-}"; res="${rest%%-*}"; dr="${rest#*-}"
+  case "$codec" in h264) codec=H.264;; hevc) codec=HEVC;; av1) codec=AV1;; mpeg2) codec=MPEG-2;; mpeg4) codec=MPEG-4;; vp9) codec=VP9;; vc1) codec=VC-1;; *) codec="${codec^^}";; esac
+  case "$res" in 4k) res=4K;; sd) res=SD;; esac
+  case "$dr" in sdr) dr=SDR;; hdr10) dr=HDR10;; hlg) dr=HLG;; dv-p*) dr="Dolby Vision P${dr#dv-p}";; esac
+  echo "$res $codec $dr"
+}
+var_name() {
+  case "$1" in
+    cpu) echo "CPU only";;
+    qsv) echo "Intel QuickSync (all on GPU)";;
+    hybq) echo "CPU decode + QuickSync encode";;
+    nv) echo "NVIDIA all on GPU (NVDEC + NVENC)";;
+    hybn) echo "CPU decode + NVENC encode";;
+    nvd) echo "NVDEC decode + CPU tone-map + NVENC";;
+    cl) echo "OpenCL GPU tone-map";;
+    plc) echo "libplacebo (Vulkan) GPU tone-map";;
+    vaapi-*) echo "VAAPI ${1#vaapi-} (all on GPU)";;
+    hybv-*) echo "CPU decode + VAAPI ${1#hybv-} encode";;
+    vad-*) echo "VAAPI ${1#vad-} decode + CPU tone-map + encode";;
+    *) echo "$1";;
+  esac
+}
+var_engine() { case "$1" in qsv|hybq) echo "Intel QuickSync (QSV)";; nv|hybn|nvd) echo "NVIDIA NVENC";; vaapi-*|hybv-*|vad-*) echo "VAAPI (${1#*-})";; *) echo "";; esac; }
+var_gpu_tonemap() { case "$1" in qsv|nv|cl|plc|vaapi-*) return 0;; *) return 1;; esac; }
+verdict() { awk -v r="$1" 'BEGIN{ if (r >= 2) print "Comfortable"; else if (r >= 1) print "Borderline"; else print "Too slow" }'; }
+sysval() { local l; for l in "${SYS_LINES[@]}"; do [ "${l%%|*}" = "$1" ] && { echo "${l#*|}"; return; }; done; }
+x1() { awk -v v="$1" 'BEGIN{ printf "%.1fx", v }'; }
+
+# ---- clip labels (optionally anonymised)
+declare -A FLABEL CLIPCOUNT FIRSTCLIP
+fi=0
+while IFS=$'\t' read -r f cl _; do
+  fi=$((fi + 1)); if [ "$ANONYMIZE" = 1 ]; then FLABEL["$f"]="$(printf 'clip-%02d' "$fi")"; else FLABEL["$f"]="$f"; fi
+  CLIPCOUNT["$cl"]=$(( ${CLIPCOUNT[$cl]:-0} + 1 )); [ -n "${FIRSTCLIP[$cl]:-}" ] || FIRSTCLIP["$cl"]="$f"
+done < <(tail -n +2 "$INV_TSV")
+flabel() { echo "${FLABEL[$1]:-$1}"; }
+FLABELS_TSV="$WORK/flabels.tsv"; for f in "${!FLABEL[@]}"; do printf '%s\t%s\n' "$f" "${FLABEL[$f]}"; done >"$FLABELS_TSV"
+AWK_FUNCS='
+function vn(v) { if (v=="cpu") return "CPU only"; if (v=="qsv") return "Intel QuickSync (all on GPU)"; if (v=="hybq") return "CPU decode + QuickSync encode"; if (v=="nv") return "NVIDIA all on GPU (NVDEC + NVENC)"; if (v=="hybn") return "CPU decode + NVENC encode"; if (v=="nvd") return "NVDEC decode + CPU tone-map + NVENC"; if (v=="cl") return "OpenCL GPU tone-map"; if (v=="plc") return "libplacebo (Vulkan) GPU tone-map"; if (v ~ /^vaapi-/) return "VAAPI " substr(v,7) " (all on GPU)"; if (v ~ /^hybv-/) return "CPU decode + VAAPI " substr(v,6) " encode"; if (v ~ /^vad-/) return "VAAPI " substr(v,5) " decode + CPU tone-map + encode"; return v }
+function cn(c,   p, n, k, codec, res, dr) { n=split(c,p,"-"); codec=p[1]; res=p[2]; dr=p[3]; for (k=4;k<=n;k++) dr=dr "-" p[k]
+  if (codec=="h264") codec="H.264"; else if (codec=="hevc") codec="HEVC"; else if (codec=="av1") codec="AV1"; else if (codec=="mpeg2") codec="MPEG-2"; else if (codec=="mpeg4") codec="MPEG-4"; else if (codec=="vp9") codec="VP9"; else if (codec=="vc1") codec="VC-1"; else codec=toupper(codec)
+  if (res=="4k") res="4K"; else if (res=="sd") res="SD"
+  if (dr=="sdr") dr="SDR"; else if (dr=="hdr10") dr="HDR10"; else if (dr=="hlg") dr="HLG"; else if (dr ~ /^dv-p/) dr="Dolby Vision P" substr(dr,5)
+  return res " " codec " " dr }
+'
+
+
+# ---- aggregate: one line per source class + scenario (mean x-realtime over the clips of that class)
+AGG_TSV="$WORK/agg.tsv"
+awk -F'\t' '
+  NR==1 {next}
+  { k=$2 "\t" $3; if (!(k in kseen)) { kseen[k]=1; order[++n]=k; lab[k]=$4 } }
+  ($6=="OK" || $6=="TIMEOUT") && $9+0>0 {
+    key=k SUBSEP $5; if (!(key in cnt)) { vl[k]=vl[k] " " $5 }
+    cnt[key]++; rt[key]+=$10; if ($11!="") { ld[key]+=$11; ldn[key]++ } }
+  END { for (i=1;i<=n;i++) { k=order[i]; m=split(vl[k], vs, " "); best=""; br=-1
+      for (j=1;j<=m;j++) { key=k SUBSEP vs[j]; mean=rt[key]/cnt[key]; if (mean>br) { br=mean; best=vs[j] } }
+      if (best=="") continue
+      bk=k SUBSEP best; bl=(ldn[bk]>0) ? ld[bk]/ldn[bk] : ""
+      ck=k SUBSEP "cpu"; cr=(cnt[ck]>0) ? rt[ck]/cnt[ck] : ""; cl2=(ldn[ck]>0) ? ld[ck]/ldn[ck] : ""
+      split(k, kk, "\t"); printf "%s|%s|%s|%s|%.4f|%s|%s|%s\n", kk[1], kk[2], lab[k], best, br, bl, cr, cl2 } }' "$RESULTS_TSV" >"$AGG_TSV"
+# columns (| separated): class scen label best bestrt bestload cpurt cpuload
+
+# ---- findings and recommendations
+FIND=()
+declare -A WINS
+nagg=0; ncomf=0; nbord=0; nslow=0
+while IFS='|' read -r cls sc label best brt bload crt cload; do
+  nagg=$((nagg + 1))
+  if awk -v r="$brt" 'BEGIN{exit !(r>=2)}'; then ncomf=$((ncomf + 1)); elif awk -v r="$brt" 'BEGIN{exit !(r>=1)}'; then nbord=$((nbord + 1)); else nslow=$((nslow + 1)); fi
+  eng="$(var_engine "$best")"; [ -n "$eng" ] && WINS["$eng"]=$(( ${WINS[$eng]:-0} + 1 ))
+done <"$AGG_TSV"
+if [ "${#WINS[@]}" -gt 0 ]; then
+  topk=""; topv=0; for k in "${!WINS[@]}"; do [ "${WINS[$k]}" -gt "$topv" ] && { topv="${WINS[$k]}"; topk="$k"; }; done
+  FIND+=("**Best hardware acceleration for this machine: $topk.** It is the fastest path in $topv of $nagg source/target combinations. In Jellyfin: Dashboard > Playback > Transcoding > Hardware acceleration.")
+elif [ "$nagg" -gt 0 ]; then
+  FIND+=("**No GPU path beat the CPU on this machine** (or none worked, see the engine table below). Software transcoding is the best option here.")
+fi
+# HDR classes: where does the tone-mapping run?
+for cls in $(cut -d'|' -f1 "$AGG_TSV" | awk '!s[$0]++'); do
+  hard="$(awk -F'|' -v c="$cls" '$1==c && $3 ~ /HDR->SDR/ { if (min=="" || $5+0<min+0) { min=$5; line=$0 } } END{print line}' "$AGG_TSV")"
+  [ -n "$hard" ] || continue
+  IFS='|' read -r _ _ hl hb hr _ hc _ <<<"$hard"; target="${hl#* -> }"
+  ctxt="n/a"; [ -n "$hc" ] && ctxt="$(x1 "$hc")"
+  if var_gpu_tonemap "$hb"; then
+    FIND+=("**$(class_label "$cls"): GPU tone-mapping works.** Hardest case ($target) runs at $(x1 "$hr") real time with '$(var_name "$hb")' (CPU only: $ctxt).")
+  else
+    FIND+=("**$(class_label "$cls"): tone-mapping runs on the CPU and limits capacity.** Hardest case ($target) reaches $(x1 "$hr") with '$(var_name "$hb")' (CPU only: $ctxt). No working GPU tone-mapping path was faster; see the engine table (OpenCL, libplacebo, tonemap_cuda / tonemap_vaapi) for why.")
+  fi
+done
+# hardware decode support (only meaningful when some hardware engine was tested)
+declare -A HWDEC_SEEN
+while IFS=$'\t' read -r f cl _ _ _ _ _ _ hwdec; do
+  [ -n "${HWDEC_SEEN[$cl]:-}" ] && continue; HWDEC_SEEN["$cl"]=1
+  if [ "$hwdec" != none ] && [ -n "$hwdec" ] && ! grep -q ':yes' <<<"$hwdec"; then
+    FIND+=("**No hardware decoder for $(class_label "$cl")** on this machine (codec or bit depth not supported by the GPU): the CPU decodes it, which limits how many streams you can run.")
+  fi
+done < <(tail -n +2 "$INV_TSV")
+while IFS='|' read -r cls sc label best brt _; do
+  awk -v r="$brt" 'BEGIN{exit !(r<1)}' && FIND+=("**Too slow: $(class_label "$cls") to ${label#* -> }.** Even the best path ('$(var_name "$best")') reaches only $(awk -v v="$brt" 'BEGIN{printf "%.2f", v}')x real time. Viewers will see stuttering: prefer direct play or a pre-transcoded version.")
+done <"$AGG_TSV"
+for L in "${ALL_VA_LABELS[@]}"; do
+  if [ "${VA_OK[$L]}" != 1 ]; then FIND+=("**VAAPI on the $L GPU is not usable:** ${VA_NOTE[$L]:-encoder did not initialise}")
+  elif [ "${VA_HW_OK[$L]}" != 1 ]; then FIND+=("**VAAPI ($L) encodes, but the full hardware path (decode + scaling) does not work:** ${VA_NOTE[$L]:-see logs/sys_vaapi_*}"); fi
+done
+if [ "$GPU_PRESENT_INTEL" = 1 ]; then
+  if [ $QSV_OK != 1 ]; then FIND+=("**Intel QuickSync is not usable:** ${QSV_NOTE:-encoder did not initialise}")
+  elif [ $QSV_HW_OK != 1 ]; then FIND+=("**Intel QuickSync encodes, but the full hardware path does not work:** ${QSV_NOTE:-see logs/sys_qsv_hw_*}"); fi
+fi
+if [ "$GPU_PRESENT_NVIDIA" = 1 ]; then
+  if [ $NV_OK != 1 ]; then FIND+=("**NVIDIA NVENC is not usable:** ${NV_NOTE:-NVENC did not initialise}")
+  elif [ $NV_HW_OK != 1 ]; then FIND+=("**NVIDIA CUDA decode path does not work:** ${NV_NOTE:-see logs/sys_nvenc_hw_probe.txt}")
+  elif [ $NV_TM != 1 ]; then FIND+=("**tonemap_cuda is missing** in this ffmpeg. It exists only in jellyfin-ffmpeg (run tools/get-ffmpeg.sh); until then NVIDIA HDR tone-mapping can use OpenCL or libplacebo."); fi
+fi
+if [ $CL_OK != 1 ] && awk -F'|' '$3 ~ /HDR->SDR/ {f=1} END{exit !f}' "$AGG_TSV"; then FIND+=("**OpenCL tone-mapping is unavailable** (no OpenCL runtime/device, or ffmpeg lacks tonemap_opencl)."); fi
+cut -f2 "$INV_TSV" | grep -q 'dv-p5' && FIND+=("Dolby Vision profile 5 clips have no HDR10 fallback layer: they are timed **without** tone-mapping, except in the libplacebo variant (which handles profile 5).")
+[ "${#FIND[@]}" -gt 0 ] || FIND+=("No findings.")
+
 {
-  echo "# Real-content benchmark (Linux) - $HOSTN"
+  echo "# Jellyfin transcode benchmark - $HOSTN"
   echo
-  echo "Run: $(date -Is) | clip ${CLIP}s | timeout ${TIMEOUT}s | quick: $QUICK"
+  echo "Run: $(date -Is) | clips of ${CLIP} s | timeout ${TIMEOUT} s per run$([ "$QUICK" = 1 ] && echo ' | quick mode')$([ "$ANONYMIZE" = 1 ] && echo ' | clip names anonymised')"
   echo
-  echo "## System and hardware engines"
+  echo "**How to read the numbers:** speeds are *times real time*. 1.0x keeps up with exactly one viewer; 4.0x is roughly four simultaneous transcodes if nothing else is running. Verdict: >= 2.0x comfortable, 1.0-2.0x borderline, < 1.0x too slow."
   echo
-  for l in "${SYS_LINES[@]}"; do echo "- **${l%%|*}:** ${l#*|}"; done
+  echo "## Summary"
   echo
-  echo "## Media inventory"
+  echo "**Bottom line:** $nagg source/target combinations tested: **$ncomf comfortable** (2x real time or more), **$nbord borderline** (1-2x), **$nslow too slow** (below real time)."
   echo
-  echo "| File | Class | Resolution | Bits | fps | Mbps | HDR | Size MB | Hardware can decode |"
-  echo "|---|---|---|---:|---:|---:|---|---:|---|"
-  awk -F'\t' 'NR>1 { printf "| %s | %s | %s | %s | %.2f | %.1f | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9 }' "$INV_TSV"
+  echo "For each source type and target, the fastest path found on this machine (mean over the clips of that type)."
   echo
-  echo "## Summary: speed as x real time (1.0 = just real time)"
+  echo "| Source | Target | Verdict | Best path | Speed | CPU only | Gain vs CPU |"
+  echo "|---|---|---|---|---:|---:|---:|"
+  while IFS='|' read -r cls sc label best brt bload crt cload; do
+    src="$(class_label "$cls")"; [ "${CLIPCOUNT[$cls]:-1}" -gt 1 ] && src="$src (${CLIPCOUNT[$cls]} clips)"
+    ctxt="n/a"; gain="n/a"
+    if [ -n "$crt" ]; then ctxt="$(x1 "$crt")"; if [ "$best" = cpu ]; then gain="CPU is best"; else gain="$(awk -v b="$brt" -v c="$crt" 'BEGIN{ if (c>0) printf "%.1fx faster", b/c; else print "n/a" }')"; fi; fi
+    echo "| $src | ${label#* -> } | $(verdict "$brt") | $(var_name "$best") | $(x1 "$brt") | $ctxt | $gain |"
+  done <"$AGG_TSV"
   echo
-  echo 'Variants: `cpu` = software; `vaapi-<gpu>` / `qsv` / `nv` = full hardware path; `hybv-<gpu>` / `hybq` / `hybn` = CPU decode + filters, hardware encode; `cl` = OpenCL tone-map.'
+  echo "## Findings and recommendations"
+  echo
+  for f in "${FIND[@]}"; do echo "- $f"; done
+  echo
+  echo "## Parallel streams"
+  echo
+  if [ "$(wc -l <"$CONC_TSV")" -le 1 ]; then echo "Not run, or no GPU path worked."; else
+    echo "How many copies of the same transcode run at real time or faster at once (the best non-CPU path of each source type)."
+    echo
+    echo "| Source | Target | Path | Parallel streams at real time | Tested up to |"
+    echo "|---|---|---|---:|---:|"
+    for cls in $(tail -n +2 "$CONC_TSV" | cut -f1 | awk '!s[$0]++'); do
+      row="$(awk -F'\t' -v c="$cls" '$1==c {print; exit}' "$CONC_TSV")"; IFS=$'\t' read -r _ _ cv csc _ <<<"$row"
+      mx="$(awk -F'\t' -v c="$cls" '$1==c && $9+0>=1.0 && $5+0>m {m=$5+0} END{print m+0}' "$CONC_TSV")"
+      tested="$(awk -F'\t' -v c="$cls" '$1==c && $5+0>m {m=$5+0} END{print m+0}' "$CONC_TSV")"
+      mxt="$mx"; [ "$mx" -ge "$tested" ] && mxt="$mx+ (test ceiling)"
+      echo "| $(class_label "$cls") | ${csc#* -> } | $(var_name "$cv") | $mxt | $tested |"
+    done
+    echo
+    echo "<details><summary>Parallel-stream measurements</summary>"
+    echo
+    echo "| Source | Path | Streams | Total fps | Slowest stream fps | Slowest x realtime | CPU % | GPU vcs/vecs/rcs % |"
+    echo "|---|---|---:|---:|---:|---:|---:|---|"
+    awk -F'\t' "$AWK_FUNCS"'FNR>1 { printf "| %s | %s | %s | %s | %s | %s | %s | %s/%s/%s |\n", cn($1), vn($3), $5, $7, $8, $9, ($10==""?"n/a":$10), ($11==""?"n/a":$11), ($12==""?"n/a":$12), ($13==""?"n/a":$13) }' "$CONC_TSV"
+    echo
+    echo "</details>"
+  fi
+  echo
+  echo "## Your hardware"
+  echo
+  echo "- **CPU:** $(sysval CPU) ($(sysval Cores) cores / $(sysval Threads) threads), $(sysval RamGB) GB RAM, governor $(sysval CpuGovernor)"
+  for l in "${SYS_LINES[@]}"; do case "${l%%|*}" in GPU*) echo "- **${l%%|*}:** ${l#*|}";; esac; done
+  echo "- **OS:** $(sysval OS) (kernel $(sysval Kernel))"
+  echo "- **ffmpeg:** $(sysval ffmpeg)"
+  idle="$(sysval IdleCpuPct)"; idlenote=""; [ "${idle:-0}" -gt 20 ] && idlenote=" (high: other programs were using the CPU, CPU numbers may be pessimistic)"
+  echo "- **CPU load before the test:** ${idle} %${idlenote}"
+  echo
+  echo "| Engine | Status | Details |"
+  echo "|---|---|---|"
+  echo "| CPU (libx264) | OK | software transcoding, always available |"
+  for L in "${ALL_VA_LABELS[@]}"; do
+    if [ "${VA_OK[$L]}" = 1 ] && [ "${VA_HW_OK[$L]}" = 1 ]; then echo "| VAAPI ($L) ${VA_NODE[$L]} | OK, full GPU path | ${VA_ENCOPT[$L]:+encode options: ${VA_ENCOPT[$L]}} |"
+    elif [ "${VA_OK[$L]}" = 1 ]; then echo "| VAAPI ($L) ${VA_NODE[$L]} | Encode only | ${VA_NOTE[$L]} |"
+    else echo "| VAAPI ($L) ${VA_NODE[$L]} | Not working | ${VA_NOTE[$L]} |"; fi
+  done
+  [ "${#ALL_VA_LABELS[@]}" -gt 0 ] || echo "| VAAPI | No Intel/AMD render node | |"
+  if [ "$GPU_PRESENT_INTEL" = 1 ]; then
+    if [ $QSV_HW_OK = 1 ]; then echo "| Intel QuickSync | OK, full GPU path | init mode $QSV_MODE |"
+    elif [ $QSV_OK = 1 ]; then echo "| Intel QuickSync | Encode only | $QSV_NOTE |"
+    else echo "| Intel QuickSync | Not working | $QSV_NOTE |"; fi
+  else echo "| Intel QuickSync | No Intel GPU | |"; fi
+  if [ "$GPU_PRESENT_NVIDIA" = 1 ]; then
+    if [ $NV_OK = 1 ]; then echo "| NVIDIA NVENC | $([ $NV_HW_OK = 1 ] && echo 'OK, full GPU path' || echo 'Encode only') | scale_cuda $([ $NV_SCALE = 1 ] && echo yes || echo no), tonemap_cuda $([ $NV_TM = 1 ] && echo yes || echo no) ${NV_NOTE} |"
+    else echo "| NVIDIA NVENC | Not working | $NV_NOTE |"; fi
+  else echo "| NVIDIA NVENC | No NVIDIA GPU | |"; fi
+  echo "| OpenCL tone-map | $([ $CL_OK = 1 ] && echo OK || echo 'Not available') | $([ $CL_OK = 1 ] && echo "$CL_DEV" || { has_filter tonemap_opencl && echo 'no usable OpenCL device' || echo 'ffmpeg has no tonemap_opencl'; }) |"
+  echo "| libplacebo (Vulkan) tone-map | $([ $PLC_OK = 1 ] && echo OK || echo 'Not available') | $([ $PLC_OK = 1 ] && echo "$PLC_DEV" || { has_filter libplacebo && echo 'no usable Vulkan device' || echo 'ffmpeg has no libplacebo'; }) |"
+  echo "| CPU tone-map (zscale) | $({ has_filter zscale && has_filter tonemap; } && echo OK || echo 'Not available') | used by the CPU and hybrid variants |"
+  echo
+  echo "## Clips tested"
+  echo
+  echo "| Clip | Source type | Resolution | fps | Mbps | HDR | Size MB | Hardware decode |"
+  echo "|---|---|---|---:|---:|---|---:|---|"
+  tail -n +2 "$INV_TSV" | while IFS=$'\t' read -r f cl res bits fps mbps hdr size hwdec; do
+    de=""; for e in $hwdec; do case "$e" in *:yes) k="${e%:yes}"; case "$k" in nv) k=NVDEC;; qsv) k=QSV;; vaapi-*) k="VAAPI (${k#vaapi-})";; esac; de+="$k + ";; esac; done; de="${de% + }"
+    [ -n "$de" ] || { [ "$hwdec" = none ] && de="not tested" || de="none (CPU)"; }
+    echo "| $(flabel "$f") | $(class_label "$cl") | $res | $(awk -v v="$fps" 'BEGIN{printf "%.2f", v}') | $(awk -v v="$mbps" 'BEGIN{printf "%.1f", v}') | $hdr | $size | $de |"
+  done
+  echo
+  echo "## All paths side by side (x real time, per clip)"
   echo
   awk -F'\t' '
-    NR==1 {next}
+    NR==FNR { fl[$1]=$2; next }
+    FNR==1 {next}
     { k=$1 "\t" $3; if (!(k in seen)) { seen[k]=1; order[++n]=k; lab[k]=$4 }
       if (!($5 in vseen)) { vseen[$5]=1; vorder[++nv]=$5 }
       st[k,$5]=$6; rt[k,$5]=$10; if (($6=="OK" || $6=="TIMEOUT") && $10+0>best[k]+0) { best[k]=$10; bv[k]=$5 } }
     function cell(k,v) { if (st[k,v]=="") return "-"; if (st[k,v]=="OK") return sprintf("%.2fx", rt[k,v]); if (st[k,v]=="TIMEOUT") return sprintf("%.2fx*", rt[k,v]); return st[k,v] }
-    END { printf "| File | Scenario |"; for (j=1;j<=nv;j++) printf " %s |", vorder[j]; print " Best |"
+    END { printf "| Clip | Target |"; for (j=1;j<=nv;j++) printf " %s |", vorder[j]; print " Best |"
           printf "|---|---|"; for (j=1;j<=nv;j++) printf "---:|"; print "---|"
-          for (i=1;i<=n;i++) { k=order[i]; split(k, p, "\t");
-            b = (bv[k]=="") ? "none" : sprintf("%s (%.2fx)", bv[k], best[k]);
-            printf "| %s | %s |", p[1], lab[k]; for (j=1;j<=nv;j++) printf " %s |", cell(k,vorder[j]); printf " %s |\n", b } }' "$RESULTS_TSV"
+          for (i=1;i<=n;i++) { k=order[i]; split(k, p, "\t"); b = (bv[k]=="") ? "none" : sprintf("%s (%.2fx)", bv[k], best[k])
+            printf "| %s | %s |", (p[1] in fl ? fl[p[1]] : p[1]), lab[k]; for (j=1;j<=nv;j++) printf " %s |", cell(k,vorder[j]); printf " %s |\n", b } }' "$FLABELS_TSV" "$RESULTS_TSV"
   echo
-  echo '`*` = run hit the timeout; value is partial throughput. SKIP/FAIL reasons are in the detail table.'
+  echo 'Path names: `cpu` software; `vaapi-<gpu>` / `qsv` / `nv` everything on the GPU; `hybv-<gpu>` / `hybq` / `hybn` CPU decode + GPU encode; `vad-<gpu>` / `nvd` GPU decode + CPU tone-map + GPU encode; `cl` OpenCL tone-map; `plc` libplacebo (Vulkan) tone-map. `*` = the run hit the timeout (partial throughput); `SKIP` / `FAIL`: the reason is in the table below.'
   echo
-  echo "## Concurrent streams"
+  echo "## Every run"
   echo
-  if [ "$(wc -l <"$CONC_TSV")" -le 1 ]; then echo "Not run or no working non-CPU variant."; else
-    echo "| Class | Variant / scenario | Streams | Aggregate fps | Slowest fps | Slowest x realtime | CPU % | GPU vcs/vecs/rcs % |"
-    echo "|---|---|---:|---:|---:|---:|---:|---|"
-    awk -F'\t' 'NR>1 { printf "| %s | %s / %s | %s | %s | %s | %s | %s | %s/%s/%s |\n", $1,$3,$4,$5,$7,$8,$9,($10==""?"n/a":$10),($11==""?"n/a":$11),($12==""?"n/a":$12),($13==""?"n/a":$13) }' "$CONC_TSV"
-    echo
-    echo "Max concurrent streams at >= real time per class:"
-    awk -F'\t' 'NR>1 { c[$1]=1; if ($9+0>=1.0 && $5+0>mx[$1]+0) mx[$1]=$5 } END { for (k in c) printf "- **%s**: %d\n", k, mx[k] }' "$CONC_TSV"
-  fi
+  echo "<details><summary>Show all runs</summary>"
   echo
-  echo "## Detail"
-  echo
-  echo "| File | Scenario | Variant | Status | fps | x realtime | CPU % | GPU vcs/vecs/rcs % | Note |"
+  echo "| Clip | Target | Path | Status | fps | x realtime | CPU % | GPU vcs/vecs/rcs % | Note |"
   echo "|---|---|---|---|---:|---:|---:|---|---|"
-  awk -F'\t' 'NR>1 { gsub(/\|/,"/",$15); printf "| %s | %s | %s | %s | %.1f | %.2f | %s | %s/%s/%s | %s |\n", $1,$4,$5,$6,$9,$10,($11==""?"n/a":$11),($12==""?"n/a":$12),($13==""?"n/a":$13),($14==""?"n/a":$14),$15 }' "$RESULTS_TSV"
+  awk -F'\t' "$AWK_FUNCS"'NR==FNR { fl[$1]=$2; next } FNR>1 { f=($1 in fl) ? fl[$1] : $1; err=$15; gsub(/\|/, "/", err)
+    printf "| %s | %s | %s | %s | %s | %s | %s | %s/%s/%s | %s |\n", f, $4, vn($5), $6, $9, $10, ($11==""?"n/a":$11), ($12==""?"n/a":$12), ($13==""?"n/a":$13), ($14==""?"n/a":$14), err }' "$FLABELS_TSV" "$RESULTS_TSV"
   echo
-  echo "Notes: only the video stream is transcoded (audio ignored). Output is H.264 at 20/8/4/2 Mbps for 4K/1080p/720p/SD. HDR is tone-mapped to SDR (cpu/hybrid: zscale+hable; vaapi: tonemap_vaapi; qsv: vpp_qsv tonemap; nv: tonemap_cuda; cl: tonemap_opencl). 'x realtime' = fps / source fps. GPU vcs/vecs/rcs columns are Intel engine load via intel_gpu_top (sudo) and read n/a for other vendors; use nvidia-smi dmon / radeontop alongside for those."
+  echo "</details>"
+  echo
+  echo "## Notes"
+  echo
+  echo "- Only the **video** stream is transcoded; audio is ignored. Output is H.264 at 20 / 8 / 4 / 2 Mbps for 4K / 1080p / 720p / SD."
+  echo "- HDR sources (HDR10, HLG, Dolby Vision) are tone-mapped to SDR. 'CPU tone-map' uses zscale + hable; the GPU variants use tonemap_vaapi, QuickSync VPP, tonemap_cuda, OpenCL or libplacebo."
+  echo "- Every run includes process start-up. OpenCL and libplacebo compile their kernels on each start, so they are slightly understated on short clips. The first run of each GPU path is preceded by a 2 s warm-up."
+  echo "- GPU vcs/vecs/rcs are Intel engine loads from intel_gpu_top (needs root); they read n/a for other vendors. Watch nvidia-smi dmon / radeontop next to the run."
+  echo "- Raw ffmpeg output of every run is in the logs folder next to this report. It contains the clip file names and paths: delete it before sharing results publicly$([ "$ANONYMIZE" = 1 ] && echo ' (this report itself uses anonymised clip names)')."
 } >"$OUTDIR/report.md"
+
+# ---- anonymise the data files too when asked (logs still contain the names)
+if [ "$ANONYMIZE" = 1 ]; then
+  for tsv in "$RESULTS_TSV" "$INV_TSV"; do
+    awk -F'\t' -v OFS='\t' 'NR==FNR { m[$1]=$2; next } FNR>1 && ($1 in m) { $1=m[$1] } { print }' <(for f in "${!FLABEL[@]}"; do printf '%s\t%s\n' "$f" "${FLABEL[$f]}"; done) "$tsv" >"$tsv.tmp" && mv "$tsv.tmp" "$tsv"
+  done
+  awk -F'\t' -v OFS='\t' 'NR==FNR { m[$1]=$2; next } FNR>1 && ($2 in m) { $2=m[$2] } { print }' <(for f in "${!FLABEL[@]}"; do printf '%s\t%s\n' "$f" "${FLABEL[$f]}"; done) "$CONC_TSV" >"$CONC_TSV.tmp" && mv "$CONC_TSV.tmp" "$CONC_TSV"
+fi
 
 printf '\n%sDone. Results: %s%s\n' "$C_GREEN" "$OUTDIR" "$C_RESET"

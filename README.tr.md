@@ -90,6 +90,23 @@ bash linux/media-test.sh --device /dev/dri/renderD129                 # yalnızc
 
 Sonuçlar `results/<tür>_<makine>_<zaman>/` altına yazılır: `report.md` (okunabilir rapor), `results.json` / `results.tsv` (veri) ve `logs/` (her çalıştırmanın ham ffmpeg çıktısı, her FAIL satırının nedenini görebilmek için).
 
+`report.md` baştan sona okunacak şekilde yazılır:
+
+1. **Summary (Özet):** her kaynak türü ve hedef için tek satır: karar (*Comfortable* >= 2x gerçek zaman, *Borderline* 1-2x, *Too slow* < 1x), en iyi yol ve CPU'ya göre kazanç.
+2. **Findings and recommendations (Bulgular ve öneriler):** Jellyfin'de hangi donanım hızlandırmanın seçileceği, HDR tone-map'in GPU'da mı CPU'da mı çalıştığı, GPU'nuzun decode edemediği codec'ler, başarısız olan motorlar ve nedenleri.
+3. **Parallel streams (Paralel akışlar):** aynı anda kaç transcode gerçek zamanda kalıyor.
+4. **Your hardware (Donanımınız)** ve motor durum tablosu, ardından tam tablolar (tüm yollar yan yana, her bir çalıştırma).
+
+```
+**Bottom line:** 10 source/target combinations tested: 10 comfortable, 0 borderline, 0 too slow.
+
+| Source        | Target         | Verdict     | Best path                         | Speed | CPU only | Gain vs CPU  |
+| 4K HEVC HDR10 | 4K HDR->SDR    | Comfortable | NVIDIA all on GPU (NVDEC + NVENC) | 5.5x  | 1.5x     | 3.7x faster  |
+| 4K HEVC HDR10 | 1080p HDR->SDR | Comfortable | NVIDIA all on GPU (NVDEC + NVENC) | 10.4x | 4.0x     | 2.6x faster  |
+```
+
+Eksiksiz bir örnek: **[docs/example-report.md](docs/example-report.md)** (rapor İngilizce üretilir). Raporu klip adlarınızı göstermeden paylaşmak için `-Anonymize` (Windows) / `--anonymize` (Linux) kullanın; rapor ve veri dosyalarında `clip-01`, `clip-02` ... olarak değiştirilir. `logs/` klasörü gerçek adları hâlâ içerir: yayımlamadan önce silin.
+
 ## Ne ölçülüyor?
 
 Her klip için, ona uygun senaryolar seçilir:

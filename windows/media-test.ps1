@@ -40,6 +40,7 @@
 .PARAMETER MaxFiles      Stop after N files.
 .PARAMETER NoConcurrency Skip the parallel-stream tests.
 .PARAMETER NoLocalCopy   Do not copy clips from a network share to local disk before testing.
+.PARAMETER Anonymize     Replace clip file names with clip-01, clip-02 ... in report.md and results.json (logs still contain the names).
 .PARAMETER Quick         10 s clips, 120 s timeout, streams 1,2,3.
 #>
 [CmdletBinding()]
@@ -56,6 +57,7 @@ param(
     [int]$MaxFiles = 0,
     [switch]$NoConcurrency,
     [switch]$NoLocalCopy,
+    [switch]$Anonymize,
     [switch]$Quick,
     [switch]$KeepWork
 )
@@ -601,7 +603,7 @@ foreach ($info in $infos) {
         $mapArgs = '-map 0:v:0 -an -sn'
 
         $swOk = $true; if ($info.Tm -and -not ($caps['zscale'] -and $caps['tonemap'])) { $swOk = $false }
-        $nvEnc = "$($script:NvEnc) -b:v ${B}M"
+        $nvOpts = "$($script:NvEnc) -b:v ${B}M"
 
         # CPU
         if ($Variants -contains 'cpu') {
@@ -638,21 +640,21 @@ foreach ($info in $infos) {
                 elseif ($info.Tm -and -not $caps['tonemap_cuda']) { $skip = 'tonemap_cuda exists only in jellyfin-ffmpeg (not in upstream/gyan builds); use PLC / CL for GPU tone-map, NVD / HYBN for CPU tone-map + NVENC' }
                 $nvf = "scale_cuda=w=${W}:h=${H}:format=nv12"
                 if ($info.Tm) { $nvf = "scale_cuda=w=${W}:h=${H}:format=p010le,tonemap_cuda=tonemap=bt2390:format=nv12:p=bt709:t=bt709:m=bt709" }
-                Invoke-Variant $info $sc.Key $label 'nv' 'NVIDIA full HW (NVDEC+NVENC)' "$Common -hwaccel cuda -hwaccel_output_format cuda -ss $ss -t $ClipSeconds -i `"$($info.Path)`" $mapArgs -vf `"$nvf`" -c:v h264_nvenc $nvEnc -f null -" $skip
+                Invoke-Variant $info $sc.Key $label 'nv' 'NVIDIA full HW (NVDEC+NVENC)' "$Common -hwaccel cuda -hwaccel_output_format cuda -ss $ss -t $ClipSeconds -i `"$($info.Path)`" $mapArgs -vf `"$nvf`" -c:v h264_nvenc $nvOpts -f null -" $skip
             }
             # hybrid: CPU decode+filters, NVENC encode
             if ($Variants -contains 'hybn') {
                 $skip = ''
                 if (-not $script:NvOk) { $skip = "NVENC not working $NvNote" } elseif (-not $swOk) { $skip = 'zscale/tonemap filters missing' }
                 $chain = Get-SwChain $info $W $H 'nv12'
-                Invoke-Variant $info $sc.Key $label 'hybn' 'CPU filters + NVENC' "$Common $seek $mapArgs -vf `"$chain`" -c:v h264_nvenc $nvEnc -f null -" $skip
+                Invoke-Variant $info $sc.Key $label 'hybn' 'CPU filters + NVENC' "$Common $seek $mapArgs -vf `"$chain`" -c:v h264_nvenc $nvOpts -f null -" $skip
             }
             # NVDEC decode, CPU tone-map, NVENC encode (HDR only): the usual fallback when tonemap_cuda is missing
             if ($Variants -contains 'nvd' -and $info.Tm) {
                 $skip = ''
                 if (-not $nvd.Ok) { $skip = $nvd.Reason } elseif (-not $script:NvOk) { $skip = 'NVENC not working' } elseif (-not $swOk) { $skip = 'zscale/tonemap filters missing' }
                 $chain = "hwdownload,format=p010le," + (Get-SwChain $info $W $H 'nv12')
-                Invoke-Variant $info $sc.Key $label 'nvd' 'NVDEC + CPU tonemap + NVENC' "$Common -hwaccel cuda -hwaccel_output_format cuda -ss $ss -t $ClipSeconds -i `"$($info.Path)`" $mapArgs -vf `"$chain`" -c:v h264_nvenc $nvEnc -f null -" $skip
+                Invoke-Variant $info $sc.Key $label 'nvd' 'NVDEC + CPU tonemap + NVENC' "$Common -hwaccel cuda -hwaccel_output_format cuda -ss $ss -t $ClipSeconds -i `"$($info.Path)`" $mapArgs -vf `"$chain`" -c:v h264_nvenc $nvOpts -f null -" $skip
             }
         }
         if ($HasAmd -and $Variants -contains 'hyba') {
@@ -672,7 +674,7 @@ foreach ($info in $infos) {
             $chain = "${pre}format=p010le,hwupload,${tm},hwdownload,format=nv12"
             $clEnc = "-c:v libx264 $enc"; $clName = 'OpenCL tonemap + x264 encode'
             if ($script:QsvOk) { $clEnc = "-c:v h264_qsv $enc"; $clName = 'OpenCL tonemap + QSV encode' }
-            elseif ($script:NvOk) { $clEnc = "-c:v h264_nvenc $nvEnc"; $clName = 'OpenCL tonemap + NVENC encode' }
+            elseif ($script:NvOk) { $clEnc = "-c:v h264_nvenc $nvOpts"; $clName = 'OpenCL tonemap + NVENC encode' }
             Invoke-Variant $info $sc.Key $label 'cl' $clName "$Common -init_hw_device $($script:ClDev) -filter_hw_device ocl $seek $mapArgs -vf `"$chain`" $clEnc -f null -" $skip
         }
         # libplacebo (Vulkan): GPU tone-map + scale for any vendor; also handles Dolby Vision profile 5 properly
@@ -683,7 +685,7 @@ foreach ($info in $infos) {
             $pf = "libplacebo=w=${W}:h=${H}:tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=nv12"
             $plEnc = "-c:v libx264 $enc"; $plName = 'libplacebo (Vulkan) tonemap + x264 encode'
             if ($script:QsvOk) { $plEnc = "-c:v h264_qsv $enc"; $plName = 'libplacebo (Vulkan) tonemap + QSV encode' }
-            elseif ($script:NvOk) { $plEnc = "-c:v h264_nvenc $nvEnc"; $plName = 'libplacebo (Vulkan) tonemap + NVENC encode' }
+            elseif ($script:NvOk) { $plEnc = "-c:v h264_nvenc $nvOpts"; $plName = 'libplacebo (Vulkan) tonemap + NVENC encode' }
             elseif ($script:AmfOk) { $plEnc = "-c:v h264_amf -b:v ${B}M"; $plName = 'libplacebo (Vulkan) tonemap + AMF encode' }
             $plLabel = $label -replace '\(DV p5, no tone-map\)', 'HDR->SDR (DV p5)'
             Invoke-Variant $info $sc.Key $plLabel 'plc' $plName "$Common -init_hw_device $($script:PlDev) -filter_hw_device vk $seek $mapArgs -vf `"$pf`" $plEnc -f null -" $skip
@@ -736,35 +738,212 @@ if (-not $NoConcurrency) {
 
 # ---------------------------------------------------------------- report
 Write-Section 'Writing report'
-$md = New-Object System.Collections.ArrayList
-[void]$md.Add("# Real-content QSV benchmark - $HostName")
-[void]$md.Add("")
-[void]$md.Add("Run: $($sys.Date) | clip ${ClipSeconds}s | timeout ${TimeoutSec}s | Quick: $($Quick.IsPresent)")
-[void]$md.Add("")
-[void]$md.Add("## System")
-[void]$md.Add("")
-foreach ($kv in $sys.GetEnumerator()) { [void]$md.Add(("- **{0}:** {1}" -f $kv.Key, ($kv.Value -join '; '))) }
-[void]$md.Add("")
-[void]$md.Add("GPUs: " + (($gpus | ForEach-Object { $_.Name }) -join ' | '))
-[void]$md.Add("")
-[void]$md.Add("Hardware engines: QSV encode " + $(if ($script:QsvOk) { 'OK' } else { 'FAILED' }) + " / QSV hardware path " + $(if ($script:QsvHwOk) { "OK ($QMode)" } else { 'not available' }) + " / OpenCL tonemap " + $(if ($script:ClOk) { 'OK' } else { 'not available' }) + " / NVENC " + $(if ($HasNvidia) { $(if ($script:NvOk) { 'OK' } else { "FAILED $NvNote" }) } else { 'no NVIDIA GPU' }) + " / AMF " + $(if ($HasAmd) { $(if ($script:AmfOk) { 'OK' } else { "FAILED $AmfNote" }) } else { 'no AMD GPU' }))
-[void]$md.Add("")
-[void]$md.Add("## Media inventory")
-[void]$md.Add("")
-[void]$md.Add("| File | Class | Resolution | Bits | fps | Mbps | HDR | Size MB | QSV HW decode |")
-[void]$md.Add("|---|---|---|---:|---:|---:|---|---:|---|")
-foreach ($i in $infos) {
-    $hd = Test-HwDecode $i
-    $hdTxt = 'no'; if ($hd.Ok) { $hdTxt = 'yes' }
-    [void]$md.Add(("| {0} | {1} | {2}x{3} | {4} | {5:N2} | {6} | {7} | {8} | {9} |" -f $i.File, $i.Class, $i.Width, $i.Height, $i.Bits, $i.Fps, $i.BitrateMbps, $i.HdrType, $i.SizeMB, $hdTxt))
+
+# ---- naming helpers
+$CodecNames = @{ h264 = 'H.264'; hevc = 'HEVC'; av1 = 'AV1'; mpeg2 = 'MPEG-2'; mpeg4 = 'MPEG-4'; vp9 = 'VP9'; vc1 = 'VC-1' }
+function Get-ClassLabel([string]$c) {
+    $p = $c -split '-'
+    $codec = $p[0]; if ($CodecNames.ContainsKey($codec)) { $codec = $CodecNames[$codec] } else { $codec = $codec.ToUpper() }
+    $res = $p[1]; if ($res -eq '4k') { $res = '4K' } elseif ($res -eq 'sd') { $res = 'SD' }
+    $dr = ($p[2..($p.Count - 1)] -join '-')
+    if ($dr -eq 'sdr') { $dr = 'SDR' } elseif ($dr -eq 'hdr10') { $dr = 'HDR10' } elseif ($dr -eq 'hlg') { $dr = 'HLG' } elseif ($dr -match '^dv-p(\d+)$') { $dr = "Dolby Vision P$($Matches[1])" }
+    return "$res $codec $dr"
+}
+$VarName = @{
+    cpu = 'CPU only'; hw = 'Intel QuickSync (all on GPU)'; hyb = 'CPU decode + QuickSync encode'; cl = 'OpenCL GPU tone-map'
+    plc = 'libplacebo (Vulkan) GPU tone-map'; nv = 'NVIDIA all on GPU (NVDEC + NVENC)'; hybn = 'CPU decode + NVENC encode'
+    nvd = 'NVDEC decode + CPU tone-map + NVENC'; hyba = 'CPU decode + AMD AMF encode'
+}
+function Get-VarName([string]$v) { if ($VarName.ContainsKey($v)) { return $VarName[$v] } else { return $v } }
+$GpuToneVars = @('hw', 'cl', 'plc', 'nv')                       # tone-mapping runs on a GPU
+$EngineOf = @{ hw = 'Intel QuickSync (QSV)'; hyb = 'Intel QuickSync (QSV)'; nv = 'NVIDIA NVENC'; hybn = 'NVIDIA NVENC'; nvd = 'NVIDIA NVENC'; hyba = 'AMD AMF' }
+function Get-Verdict([double]$rt) { if ($rt -ge 2.0) { return 'Comfortable' } elseif ($rt -ge 1.0) { return 'Borderline' } else { return 'Too slow' } }
+
+# ---- clip labels (optionally anonymised)
+$fileLabel = @{}; $fi = 0
+foreach ($i in $infos) { $fi++; if ($Anonymize) { $fileLabel[$i.File] = ('clip-{0:D2}' -f $fi) } else { $fileLabel[$i.File] = $i.File } }
+function Get-FileLabel([string]$f) { if ($fileLabel.ContainsKey($f)) { return $fileLabel[$f] } else { return $f } }
+
+# ---- aggregate: one entry per source class + scenario (mean x-realtime over the clips of that class)
+$aggRows = New-Object System.Collections.ArrayList
+foreach ($cls in @($script:Results | Select-Object -ExpandProperty Class -Unique)) {
+    $clipCount = @($infos | Where-Object { $_.Class -eq $cls }).Count
+    foreach ($sk in 'to1080', 'to720', 'same') {
+        $rows = @($script:Results | Where-Object { $_.Class -eq $cls -and $_.Scenario -eq $sk })
+        if ($rows.Count -eq 0) { continue }
+        $byVar = @{}
+        foreach ($g in ($rows | Group-Object Variant)) {
+            $good = @($g.Group | Where-Object { ($_.Status -eq 'OK' -or $_.Status -eq 'TIMEOUT') -and $_.Fps -gt 0 })
+            if ($good.Count -gt 0) {
+                $cpuVals = @($good | Where-Object { $null -ne $_.CpuAvg })
+                $cpuMean = $null; if ($cpuVals.Count -gt 0) { $cpuMean = ($cpuVals | Measure-Object -Property CpuAvg -Average).Average }
+                $byVar[$g.Name] = [pscustomobject]@{ Var = $g.Name; Rt = ($good | Measure-Object -Property Realtime -Average).Average; Load = $cpuMean }
+            }
+        }
+        if ($byVar.Count -eq 0) { continue }
+        $best = $byVar.Values | Sort-Object Rt -Descending | Select-Object -First 1
+        $cpu = $null; if ($byVar.ContainsKey('cpu')) { $cpu = $byVar['cpu'] }
+        $target = $rows[0].ScenarioLabel; if ($target -match ' -> (.*)$') { $target = $Matches[1] }
+        [void]$aggRows.Add([pscustomobject]@{
+            Class = $cls; Clips = $clipCount; Scen = $sk; Target = $target; BestVar = $best.Var; BestRt = $best.Rt; BestLoad = $best.Load
+            CpuRt = $(if ($cpu) { $cpu.Rt } else { $null }); CpuLoad = $(if ($cpu) { $cpu.Load } else { $null })
+        })
+    }
 }
 
+# ---- hardware decode support per clip (QSV / NVDEC); AMF decode is not tested
+function Get-DecodeEngines($i) {
+    $e = @()
+    if ($HasIntel) { if ((Test-HwDecode $i).Ok) { $e += 'QSV' } }
+    if ($HasNvidia) { if ((Test-NvDecode $i).Ok) { $e += 'NVDEC' } }
+    return $e
+}
+
+# ---- findings and recommendations
+$find = New-Object System.Collections.ArrayList
+$wins = @{}
+foreach ($a in $aggRows) { if ($a.BestVar -ne 'cpu' -and $EngineOf.ContainsKey($a.BestVar)) { $en = $EngineOf[$a.BestVar]; if (-not $wins.ContainsKey($en)) { $wins[$en] = 0 }; $wins[$en]++ } }
+if ($wins.Count -gt 0) {
+    $top = ($wins.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1)
+    [void]$find.Add("**Best hardware acceleration for this machine: $($top.Key).** It is the fastest path in $($top.Value) of $($aggRows.Count) source/target combinations. In Jellyfin: Dashboard > Playback > Transcoding > Hardware acceleration.")
+} elseif ($aggRows.Count -gt 0) {
+    [void]$find.Add("**No GPU path beat the CPU on this machine** (or none worked, see the engine table below). Software transcoding is the best option here.")
+}
+foreach ($cls in @($aggRows | Select-Object -ExpandProperty Class -Unique)) {
+    $hdrRows = @($aggRows | Where-Object { $_.Class -eq $cls -and $_.Target -match 'HDR->SDR' })
+    if ($hdrRows.Count -eq 0) { continue }
+    $hard = $hdrRows | Sort-Object BestRt | Select-Object -First 1
+    $cpuTxt = 'n/a'; if ($null -ne $hard.CpuRt) { $cpuTxt = ('{0:N1}x' -f $hard.CpuRt) }
+    if ($GpuToneVars -contains $hard.BestVar) {
+        [void]$find.Add(("**{0}: GPU tone-mapping works.** Hardest case ({1}) runs at {2:N1}x real time with '{3}' (CPU only: {4})." -f (Get-ClassLabel $cls), $hard.Target, $hard.BestRt, (Get-VarName $hard.BestVar), $cpuTxt))
+    } else {
+        [void]$find.Add(("**{0}: tone-mapping runs on the CPU and limits capacity.** Hardest case ({1}) reaches {2:N1}x with '{3}' (CPU only: {4}). No working GPU tone-mapping path was faster; see the engine table (OpenCL, libplacebo, tonemap_cuda) for why." -f (Get-ClassLabel $cls), $hard.Target, $hard.BestRt, (Get-VarName $hard.BestVar), $cpuTxt))
+    }
+}
+if ($HasIntel -or $HasNvidia) {
+    foreach ($cls in @($infos | Select-Object -ExpandProperty Class -Unique)) {
+        $ci = $infos | Where-Object { $_.Class -eq $cls } | Select-Object -First 1
+        $de = @(Get-DecodeEngines $ci)
+        if ($de.Count -eq 0) { [void]$find.Add(("**No hardware decoder for {0}** on this machine (codec or bit depth not supported by the GPU): the CPU decodes it, which limits how many streams you can run." -f (Get-ClassLabel $cls))) }
+    }
+}
+foreach ($a in ($aggRows | Where-Object { $_.BestRt -lt 1.0 })) {
+    [void]$find.Add(("**Too slow: {0} to {1}.** Even the best path ('{2}') reaches only {3:N2}x real time. Viewers will see stuttering: prefer direct play or a pre-transcoded version." -f (Get-ClassLabel $a.Class), $a.Target, (Get-VarName $a.BestVar), $a.BestRt))
+}
+if ($HasIntel -and -not $script:QsvOk) { [void]$find.Add("**Intel QuickSync is not usable** on this machine: the GPU or driver is not exposing the encoder (check the driver, and that the iGPU is enabled).") }
+elseif ($HasIntel -and -not $script:QsvHwOk) { [void]$find.Add("**Intel QuickSync encodes, but the full hardware path (decode + scaling) does not work.** Only the encoder is used, so the CPU still decodes.") }
+if ($HasNvidia -and -not $script:NvOk) { [void]$find.Add("**NVIDIA NVENC is not usable:** $NvNote") }
+elseif ($HasNvidia -and -not $script:NvHwOk) { [void]$find.Add("**NVIDIA CUDA decode path does not work:** $NvNote") }
+if ($HasNvidia -and $script:NvOk -and -not $caps['tonemap_cuda']) { [void]$find.Add("**tonemap_cuda is missing** in this ffmpeg. It exists only in jellyfin-ffmpeg (run tools\get-ffmpeg.ps1); until then NVIDIA HDR tone-mapping can use OpenCL or libplacebo.") }
+if ($HasAmd -and -not $script:AmfOk) { [void]$find.Add("**AMD AMF is not usable:** $AmfNote") }
+if (-not $script:ClOk -and $aggRows.Count -gt 0 -and @($infos | Where-Object { $_.Tm }).Count -gt 0) { [void]$find.Add("**OpenCL tone-mapping is unavailable** (no OpenCL runtime/device, or ffmpeg lacks tonemap_opencl).") }
+if (@($infos | Where-Object { $_.Dv -eq 5 }).Count -gt 0) { [void]$find.Add("Dolby Vision profile 5 clips have no HDR10 fallback layer: they are timed **without** tone-mapping, except in the libplacebo variant (which handles profile 5).") }
+if ($find.Count -eq 0) { [void]$find.Add("No findings.") }
+
+# ---- write the report
+$md = New-Object System.Collections.ArrayList
+[void]$md.Add("# Jellyfin transcode benchmark - $HostName")
 [void]$md.Add("")
-[void]$md.Add("## Summary: speed as x real time (1.0 = just real time)")
+[void]$md.Add("Run: $($sys.Date) | clips of $ClipSeconds s | timeout $TimeoutSec s per run$(if ($Quick) { ' | quick mode' })$(if ($Anonymize) { ' | clip names anonymised' })")
 [void]$md.Add("")
-$colNames = [ordered]@{ cpu = 'CPU'; hw = 'QSV full HW'; hyb = 'CPU filters + QSV enc'; cl = 'OpenCL tonemap + enc'; plc = 'libplacebo (Vulkan) tonemap + enc'; nv ='NVIDIA full HW'; hybn = 'CPU filters + NVENC'; nvd = 'NVDEC + CPU tonemap + NVENC'; hyba = 'CPU filters + AMD AMF' }
+[void]$md.Add("**How to read the numbers:** speeds are *times real time*. 1.0x keeps up with exactly one viewer; 4.0x is roughly four simultaneous transcodes if nothing else is running. Verdict: >= 2.0x comfortable, 1.0-2.0x borderline, < 1.0x too slow.")
+[void]$md.Add("")
+
+[void]$md.Add("## Summary")
+[void]$md.Add("")
+$nComf = @($aggRows | Where-Object { $_.BestRt -ge 2.0 }).Count; $nBord = @($aggRows | Where-Object { $_.BestRt -ge 1.0 -and $_.BestRt -lt 2.0 }).Count; $nSlow = @($aggRows | Where-Object { $_.BestRt -lt 1.0 }).Count
+[void]$md.Add("**Bottom line:** $($aggRows.Count) source/target combinations tested: **$nComf comfortable** (2x real time or more), **$nBord borderline** (1-2x), **$nSlow too slow** (below real time).")
+[void]$md.Add("")
+[void]$md.Add("For each source type and target, the fastest path found on this machine (mean over the clips of that type).")
+[void]$md.Add("")
+[void]$md.Add("| Source | Target | Verdict | Best path | Speed | CPU only | Gain vs CPU |")
+[void]$md.Add("|---|---|---|---|---:|---:|---:|")
+foreach ($a in $aggRows) {
+    $src = Get-ClassLabel $a.Class; if ($a.Clips -gt 1) { $src += " ($($a.Clips) clips)" }
+    $cpuTxt = 'n/a'; $gain = 'n/a'
+    if ($null -ne $a.CpuRt) { $cpuTxt = ('{0:N1}x' -f $a.CpuRt); if ($a.BestVar -eq 'cpu') { $gain = 'CPU is best' } elseif ($a.CpuRt -gt 0) { $gain = ('{0:N1}x faster' -f ($a.BestRt / $a.CpuRt)) } }
+    [void]$md.Add(("| {0} | {1} | {2} | {3} | {4:N1}x | {5} | {6} |" -f $src, $a.Target, (Get-Verdict $a.BestRt), (Get-VarName $a.BestVar), $a.BestRt, $cpuTxt, $gain))
+}
+[void]$md.Add("")
+
+[void]$md.Add("## Findings and recommendations")
+[void]$md.Add("")
+foreach ($f in $find) { [void]$md.Add("- $f") }
+[void]$md.Add("")
+
+[void]$md.Add("## Parallel streams")
+[void]$md.Add("")
+if ($ConcRows.Count -eq 0) { [void]$md.Add("Not run, or no GPU path worked.") } else {
+    [void]$md.Add("How many copies of the same transcode run at real time or faster at once (the best non-CPU path of each source type).")
+    [void]$md.Add("")
+    [void]$md.Add("| Source | Target | Path | Parallel streams at real time | Tested up to |")
+    [void]$md.Add("|---|---|---|---:|---:|")
+    foreach ($grp in ($ConcRows | Group-Object Class)) {
+        $okRows = @($grp.Group | Where-Object { $_.MinRealtime -ge 1.0 })
+        $mx = 0; if ($okRows.Count -gt 0) { $mx = ($okRows | Measure-Object -Property Streams -Maximum).Maximum }
+        $tested = ($grp.Group | Measure-Object -Property Streams -Maximum).Maximum
+        $first = $grp.Group[0]; $tgt = $first.Scenario; if ($tgt -match ' -> (.*)$') { $tgt = $Matches[1] }
+        $mxTxt = "$mx"; if ($mx -ge $tested) { $mxTxt = "$mx+ (test ceiling)" }
+        [void]$md.Add(("| {0} | {1} | {2} | {3} | {4} |" -f (Get-ClassLabel $grp.Name), $tgt, (Get-VarName $first.Variant), $mxTxt, $tested))
+    }
+    [void]$md.Add("")
+    [void]$md.Add("<details><summary>Parallel-stream measurements</summary>")
+    [void]$md.Add("")
+    [void]$md.Add("| Source | Path | Streams | Total fps | Slowest stream fps | Slowest x realtime | CPU % | GPU dec/enc/vpp % |")
+    [void]$md.Add("|---|---|---:|---:|---:|---:|---:|---|")
+    foreach ($c in $ConcRows) {
+        [void]$md.Add(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7:N0}/{8:N0}/{9:N0} |" -f (Get-ClassLabel $c.Class), (Get-VarName $c.Variant), $c.Streams, $c.AggFps, $c.MinFps, $c.MinRealtime, (F $c.CpuAvg '{0:N0}'), $c.GpuDec, $c.GpuEnc, $c.GpuVpp))
+    }
+    [void]$md.Add("")
+    [void]$md.Add("</details>")
+}
+[void]$md.Add("")
+
+[void]$md.Add("## Your hardware")
+[void]$md.Add("")
+[void]$md.Add("- **CPU:** $($sys['CPU']) ($($sys['Cores']) cores / $($sys['Threads']) threads), $($sys['RamGB']) GB RAM")
+[void]$md.Add("- **GPUs:** $(($gpus | ForEach-Object { '{0} (driver {1})' -f $_.Name, $_.DriverVersion }) -join '; ')")
+$pp = "$($sys['PowerPlan'])"; if ($pp -match '\(([^)]+)\)\s*$') { $pp = $Matches[1] }
+[void]$md.Add("- **OS:** $($sys['OS']) | **Power plan:** $pp")
+[void]$md.Add("- **ffmpeg:** $($sys['Ffmpeg'])")
+$idleNote = ''; if ($null -ne $sys['IdleCpuPct'] -and $sys['IdleCpuPct'] -gt 20) { $idleNote = ' (high: other programs were using the CPU, CPU numbers may be pessimistic)' }
+[void]$md.Add("- **CPU load before the test:** $($sys['IdleCpuPct']) %$idleNote")
+[void]$md.Add("")
+[void]$md.Add("| Engine | Status | Details |")
+[void]$md.Add("|---|---|---|")
+[void]$md.Add("| CPU (libx264) | OK | software transcoding, always available |")
+if ($HasIntel) {
+    if ($script:QsvHwOk) { [void]$md.Add("| Intel QuickSync | OK, full GPU path | init mode $QMode |") }
+    elseif ($script:QsvOk) { [void]$md.Add("| Intel QuickSync | Encode only | the full hardware decode + scaling path did not start |") }
+    else { [void]$md.Add("| Intel QuickSync | Not working | encoder did not initialise |") }
+} else { [void]$md.Add("| Intel QuickSync | No Intel GPU | |") }
+if ($HasNvidia) {
+    if ($script:NvOk) { [void]$md.Add(("| NVIDIA NVENC | {0} | encode preset '{1}', scale_cuda {2}, tonemap_cuda {3} |" -f $(if ($script:NvHwOk) { 'OK, full GPU path' } else { 'Encode only' }), $script:NvEnc.Trim(), $caps['scale_cuda'], $caps['tonemap_cuda'])) }
+    else { [void]$md.Add("| NVIDIA NVENC | Not working | $NvNote |") }
+} else { [void]$md.Add("| NVIDIA NVENC | No NVIDIA GPU | |") }
+if ($HasAmd) {
+    if ($script:AmfOk) { [void]$md.Add("| AMD AMF | OK, encode | decode is done by the CPU in these tests |") } else { [void]$md.Add("| AMD AMF | Not working | $AmfNote |") }
+} else { [void]$md.Add("| AMD AMF | No AMD GPU | |") }
+[void]$md.Add("| OpenCL tone-map | $(if ($script:ClOk) { 'OK' } else { 'Not available' }) | $(if ($script:ClOk) { $script:ClDev } elseif (-not $caps['tonemap_opencl']) { 'ffmpeg has no tonemap_opencl' } else { 'no usable OpenCL device' }) |")
+[void]$md.Add("| libplacebo (Vulkan) tone-map | $(if ($script:PlOk) { 'OK' } else { 'Not available' }) | $(if ($script:PlOk) { $script:PlDev } elseif (-not $caps['libplacebo']) { 'ffmpeg has no libplacebo' } else { 'no usable Vulkan device' }) |")
+[void]$md.Add("| CPU tone-map (zscale) | $(if ($caps['zscale'] -and $caps['tonemap']) { 'OK' } else { 'Not available' }) | used by the CPU and hybrid variants |")
+[void]$md.Add("")
+
+[void]$md.Add("## Clips tested")
+[void]$md.Add("")
+[void]$md.Add("| Clip | Source type | Resolution | fps | Mbps | HDR | Size MB | Hardware decode |")
+[void]$md.Add("|---|---|---|---:|---:|---|---:|---|")
+foreach ($i in $infos) {
+    $de = @(Get-DecodeEngines $i); $deTxt = 'none (CPU)'; if ($de.Count -gt 0) { $deTxt = $de -join ' + ' } elseif (-not ($HasIntel -or $HasNvidia)) { $deTxt = 'not tested' }
+    [void]$md.Add(("| {0} | {1} | {2}x{3} | {4:N2} | {5} | {6} | {7} | {8} |" -f (Get-FileLabel $i.File), (Get-ClassLabel $i.Class), $i.Width, $i.Height, $i.Fps, $i.BitrateMbps, $i.HdrType, $i.SizeMB, $deTxt))
+}
+[void]$md.Add("")
+
+[void]$md.Add("## All paths side by side (x real time, per clip)")
+[void]$md.Add("")
+$colNames = [ordered]@{ cpu = 'CPU'; hw = 'QSV full GPU'; hyb = 'CPU + QSV enc'; cl = 'OpenCL tone-map'; plc = 'libplacebo'; nv = 'NVIDIA full GPU'; hybn = 'CPU + NVENC'; nvd = 'NVDEC + CPU tone-map'; hyba = 'CPU + AMF' }
 $presentVars = @($colNames.Keys | Where-Object { $k = $_; @($script:Results | Where-Object { $_.Variant -eq $k }).Count -gt 0 })
-[void]$md.Add("| File | Scenario | " + (($presentVars | ForEach-Object { $colNames[$_] }) -join ' | ') + " | Best |")
+[void]$md.Add("| Clip | Target | " + (($presentVars | ForEach-Object { $colNames[$_] }) -join ' | ') + " | Best |")
 [void]$md.Add("|---|---|" + (($presentVars | ForEach-Object { '---:' }) -join '|') + "|---|")
 $groups = $script:Results | Group-Object { "{0}|{1}" -f $_.File, $_.Scenario }
 foreach ($grp in $groups) {
@@ -777,46 +956,47 @@ foreach ($grp in $groups) {
         elseif ($r.Status -eq 'TIMEOUT') { $cells += ('{0:N2}x*' -f $r.Realtime) }
         else { $cells += $r.Status }
     }
-    $bestRow = $rows | Where-Object { $_.Status -in 'OK', 'TIMEOUT' } | Sort-Object Realtime -Descending | Select-Object -First 1
-    $bt = 'none'; if ($bestRow) { $bt = "{0} ({1:N2}x)" -f $bestRow.Variant.ToUpper(), $bestRow.Realtime }
-    [void]$md.Add(("| {0} | {1} | {2} | {3} |" -f $rows[0].File, $rows[0].ScenarioLabel, ($cells -join ' | '), $bt))
+    $bestRow = $rows | Where-Object { $_.Status -eq 'OK' -or $_.Status -eq 'TIMEOUT' } | Sort-Object Realtime -Descending | Select-Object -First 1
+    $bt = 'none'; if ($bestRow) { $bt = "{0} ({1:N2}x)" -f $colNames[$bestRow.Variant], $bestRow.Realtime }
+    [void]$md.Add(("| {0} | {1} | {2} | {3} |" -f (Get-FileLabel $rows[0].File), $rows[0].ScenarioLabel, ($cells -join ' | '), $bt))
 }
 [void]$md.Add("")
-[void]$md.Add("`*` = run hit the timeout; value is the partial throughput. SKIP/FAIL reasons are in the detail table.")
+[void]$md.Add("`*` = the run hit the timeout; the value is partial throughput. `SKIP` / `FAIL`: the reason is in the table below.")
+[void]$md.Add("")
 
+[void]$md.Add("## Every run")
 [void]$md.Add("")
-[void]$md.Add("## Concurrent streams")
+[void]$md.Add("<details><summary>Show all runs</summary>")
 [void]$md.Add("")
-if ($ConcRows.Count -eq 0) { [void]$md.Add("Not run or no working non-CPU variant.") } else {
-    [void]$md.Add("| Class | Variant / scenario | Streams | Aggregate fps | Slowest fps | Slowest x realtime | CPU % | GPU dec/enc/vpp % |")
-    [void]$md.Add("|---|---|---:|---:|---:|---:|---:|---|")
-    foreach ($c in $ConcRows) {
-        [void]$md.Add(("| {0} | {1} / {2} | {3} | {4} | {5} | {6} | {7} | {8:N0}/{9:N0}/{10:N0} |" -f $c.Class, $c.Variant, $c.Scenario, $c.Streams, $c.AggFps, $c.MinFps, $c.MinRealtime, (F $c.CpuAvg '{0:N0}'), $c.GpuDec, $c.GpuEnc, $c.GpuVpp))
-    }
-    [void]$md.Add("")
-    [void]$md.Add("Max concurrent streams at >= real time per class:")
-    foreach ($grp in ($ConcRows | Group-Object Class)) {
-        $okRows = @($grp.Group | Where-Object { $_.MinRealtime -ge 1.0 })
-        $mx = 0; if ($okRows.Count -gt 0) { $mx = ($okRows | Measure-Object -Property Streams -Maximum).Maximum }
-        $capped = ''; if ($mx -ge ($Streams | Measure-Object -Maximum).Maximum) { $capped = ' (test ceiling reached, real limit may be higher)' }
-        [void]$md.Add("- **$($grp.Name)**: $mx$capped")
-    }
-}
-
-[void]$md.Add("")
-[void]$md.Add("## Detail")
-[void]$md.Add("")
-[void]$md.Add("| File | Scenario | Variant | Status | fps | x realtime | CPU % | GPU dec/enc/vpp % | Note |")
+[void]$md.Add("| Clip | Target | Path | Status | fps | x realtime | CPU % | GPU dec/enc/vpp % | Note |")
 [void]$md.Add("|---|---|---|---|---:|---:|---:|---|---|")
 foreach ($r in $script:Results) {
-    [void]$md.Add(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7:N0}/{8:N0}/{9:N0} | {10} |" -f $r.File, $r.ScenarioLabel, $r.VariantLabel, $r.Status, (F $r.Fps '{0:N1}'), (F $r.Realtime '{0:N2}'), (F $r.CpuAvg '{0:N0}'), $r.GpuDec, $r.GpuEnc, $r.GpuVpp, ($r.Error -replace '\|', '/')))
+    [void]$md.Add(("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7:N0}/{8:N0}/{9:N0} | {10} |" -f (Get-FileLabel $r.File), $r.ScenarioLabel, (Get-VarName $r.Variant), $r.Status, (F $r.Fps '{0:N1}'), (F $r.Realtime '{0:N2}'), (F $r.CpuAvg '{0:N0}'), $r.GpuDec, $r.GpuEnc, $r.GpuVpp, ($r.Error -replace '\|', '/')))
 }
 [void]$md.Add("")
-[void]$md.Add("Notes: only the video stream is transcoded (audio ignored). Output is H.264 at 20/8/4/2 Mbps for 4K/1080p/720p/SD. HDR sources are tone-mapped to SDR (CPU: zscale+hable; HW: vpp_qsv tonemap; CL: tonemap_opencl). 'x realtime' = fps / source fps. GPU % comes from Windows GPU Engine counters and may read 0 when unavailable.")
+[void]$md.Add("</details>")
+[void]$md.Add("")
+
+[void]$md.Add("## Notes")
+[void]$md.Add("")
+[void]$md.Add("- Only the **video** stream is transcoded; audio is ignored. Output is H.264 at 20 / 8 / 4 / 2 Mbps for 4K / 1080p / 720p / SD.")
+[void]$md.Add("- HDR sources (HDR10, HLG, Dolby Vision) are tone-mapped to SDR. 'CPU tone-map' uses zscale + hable; the GPU variants use QuickSync VPP, tonemap_cuda, OpenCL or libplacebo.")
+[void]$md.Add("- Every run includes process start-up. OpenCL and libplacebo compile their kernels on each start, so they are slightly understated on short clips. The first run of each GPU path is preceded by a 2 s warm-up.")
+[void]$md.Add("- GPU dec/enc/vpp % are Windows GPU engine counters summed over all adapters; they read 0 when the counters are unavailable.")
+[void]$md.Add("- Raw ffmpeg output of every run is in the logs folder next to this report. It contains the clip file names and paths: delete it before sharing results publicly$(if ($Anonymize) { ' (this report itself uses anonymised clip names)' }).")
 
 $md | Out-File -FilePath (Join-Path $OutDir 'report.md') -Encoding utf8
-[pscustomobject]@{ System = $sys; Capabilities = $caps; QsvOk = $script:QsvOk; QsvHwOk = $script:QsvHwOk; QsvInitMode = $QMode; OpenClOk = $script:ClOk
-    Media = $infos; Results = $script:Results; Concurrency = $ConcRows } | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $OutDir 'results.json') -Encoding utf8
+
+# ---- machine-readable export (clip names anonymised on request)
+$jsonMedia = $infos; $jsonResults = $script:Results; $jsonConc = $ConcRows
+if ($Anonymize) {
+    $jsonMedia = @($infos | ForEach-Object { $c = $_.PSObject.Copy(); $c.File = (Get-FileLabel $_.File); $c.Path = ''; $c })
+    $jsonResults = @($script:Results | ForEach-Object { $c = $_.PSObject.Copy(); $c.File = (Get-FileLabel $_.File); $c.Cmd = ''; $c })
+    $jsonConc = @($ConcRows | ForEach-Object { $c = $_.PSObject.Copy(); $c.File = (Get-FileLabel $_.File); $c })
+}
+[pscustomobject]@{ System = $sys; Capabilities = $caps; QsvOk = $script:QsvOk; QsvHwOk = $script:QsvHwOk; QsvInitMode = $QMode; OpenClOk = $script:ClOk; OpenClDevice = $script:ClDev
+    LibplaceboOk = $script:PlOk; NvencOk = $script:NvOk; AmfOk = $script:AmfOk
+    Media = $jsonMedia; Results = $jsonResults; Concurrency = $jsonConc; Findings = @($find) } | ConvertTo-Json -Depth 6 | Out-File -FilePath (Join-Path $OutDir 'results.json') -Encoding utf8
 
 if (-not $KeepWork) { Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Host ""

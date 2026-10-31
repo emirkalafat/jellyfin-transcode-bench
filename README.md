@@ -90,6 +90,23 @@ bash linux/media-test.sh --device /dev/dri/renderD129                 # test one
 
 Results land in `results/<kind>_<host>_<timestamp>/`: `report.md` (human readable), `results.json` / `results.tsv` (data) and `logs/` (raw ffmpeg output of every run, so any FAIL can be diagnosed).
 
+`report.md` is written to be read top to bottom:
+
+1. **Summary**: one line per source type and target with a verdict (*Comfortable* >= 2x real time, *Borderline* 1-2x, *Too slow* < 1x), the best path and its gain over the CPU.
+2. **Findings and recommendations**: which hardware acceleration to pick in Jellyfin, whether HDR tone-mapping runs on the GPU or the CPU, codecs your GPU cannot decode, engines that failed and why.
+3. **Parallel streams**: how many simultaneous transcodes still run at real time.
+4. **Your hardware** and an engine status table, then the full tables (all paths side by side, every single run).
+
+```
+**Bottom line:** 10 source/target combinations tested: 10 comfortable, 0 borderline, 0 too slow.
+
+| Source        | Target         | Verdict     | Best path                         | Speed | CPU only | Gain vs CPU  |
+| 4K HEVC HDR10 | 4K HDR->SDR    | Comfortable | NVIDIA all on GPU (NVDEC + NVENC) | 5.5x  | 1.5x     | 3.7x faster  |
+| 4K HEVC HDR10 | 1080p HDR->SDR | Comfortable | NVIDIA all on GPU (NVDEC + NVENC) | 10.4x | 4.0x     | 2.6x faster  |
+```
+
+A complete example: **[docs/example-report.md](docs/example-report.md)**. To share a report without revealing your clip names use `-Anonymize` (Windows) / `--anonymize` (Linux); they are replaced by `clip-01`, `clip-02` ... in the report and the data files. The `logs/` folder still contains the real names: delete it before publishing.
+
 ## What is measured
 
 For every clip the suite picks the scenarios that make sense for it:
